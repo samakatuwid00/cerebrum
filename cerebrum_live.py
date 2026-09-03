@@ -181,14 +181,9 @@ def _signal_loop():
                     reason = meta_res["reason"]
                     trend_label = meta_res["trend_label"]
                     prob = meta_res["probability"] or 0.0
-                    side = meta_res["side"] or "WATCH"
                     atr = meta_res.get("atr_pct", None)
                     hist = meta_res.get("macd_hist", None)
-                    atr_s = f" ATR%={atr:.4f}" if atr is not None else ""
-                    hist_s = f" hist={hist:.2f}" if hist is not None else ""
-                    trend_emoji = {1: "\U0001f4c8", -1: "\U0001f4c9", 0: "\U0001f6cc"}.get(meta_res["trend"], "\U0001f6cc")
-                    status = (f"{trend_emoji} [META NO-TRADE] WATCH trend={trend_label} | P(up)={prob:.3f}{atr_s}{hist_s} | "
-                              f"reason: {reason}")
+                    status = alert.format_watch(prob, trend_label, meta_res["trend"], reason, atr, hist)
                     print(status)
                     alert.send_message(status)
                     # Legacy fallback is now *gated* — only emit if meta was high-confidence WATCH

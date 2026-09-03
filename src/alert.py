@@ -125,16 +125,10 @@ def _evidence_block(df: pd.DataFrame, target_hour: int, target_dow: int,
 def format_window(result: dict, side: str = "BUY", threshold: float | None = None,
                    asset: str = "XAU/USD", df: Optional[pd.DataFrame] = None,
                    timeframe: str = "30m") -> str:
-    """Return a pretty multi-line message for a single buy/sell window.
+    """User-friendly BUY/SELL alert (Option B friendly + details).
 
-    Sections:
-      1. Header  (side, asset, confidence)
-      2. Time    (when, time until)
-      3. Stats   (edge, threshold, sample size)
-      4. Evidence (if df is passed: hit rate, avg move, best/worst)
-      5. Action  (what the user should do manually)
-
-    timeframe: "30m" or "4h" - controls action line language
+    Friendly first, details second. Keeps emoji + confidence but uses plain
+    language for newcomers, with a collapsible Details line for power users.
     """
     when = datetime.fromisoformat(result["window_start_utc"])
     th = threshold if threshold is not None else float(
@@ -144,71 +138,111 @@ def format_window(result: dict, side: str = "BUY", threshold: float | None = Non
     edge = result.get("edge_mean_ret", 0.0)
     n = result.get("n_samples", 0)
 
-    # 1. Header with emoji (send_message() handles ASCII-safe for console)
+    # 1. Friendly header
     if side == "BUY":
         arrow = "\U0001f7e2 BUY"  # green circle
-        conf_label = "\U0001f4aa STRONG" if prob >= 0.75 else "\U0001f44d MEDIUM" if prob >= 0.60 else "\U0001f7e1 WEAK"
+        plain = "Gold likely to go UP"
     else:
         arrow = "\U0001f534 SELL"  # red circle
-        conf_label = "\U0001f4aa STRONG" if prob >= 0.75 else "\U0001f44d MEDIUM" if prob >= 0.60 else "\U0001f7e1 WEAK"
+        plain = "Gold likely to go DOWN"
+    if prob >= 0.75:
+        conf_label = "\U0001f4aa STRONG"
+        conf_word = "High"
+    elif prob >= 0.60:
+        conf_label = "\U0001f44d MEDIUM"
+        conf_word = "Medium"
+    else:
+        conf_label = "\U0001f7e1 WEAK"
+        conf_word = "Low"
 
-    header = f"{arrow} {asset}  |  {conf_label} CONFIDENCE: {prob*100:.0f}%"
+    header = f"{arrow} {asset} — {plain}"
+    sub = f"{conf_label} Confidence: {conf_word} ({prob*100:.0f}%) — needs {th*100:.0f}%"
 
-    # 2. Time
+    # 2. When (plain)
     now = datetime.now(timezone.utc)
     if when.tzinfo is None:
         when = when.replace(tzinfo=timezone.utc)
     minutes_until = int((when - now).total_seconds() / 60)
     if minutes_until < 0:
-        time_str = f"at {when.strftime('%Y-%m-%d %H:%M UTC')}  (in the past)"
+        time_str = f"\U000023F0 When: {when.strftime('%Y-%m-%d %H:%M UTC')} (now)"
     elif minutes_until < 60:
-        time_str = f"at {when.strftime('%Y-%m-%d %H:%M UTC')}  (in {minutes_until} min)"
+        time_str = f"\U000023F0 When: {when.strftime('%Y-%m-%d %H:%M UTC')} (in {minutes_until} min) — {timeframe} trade"
     elif minutes_until < 60 * 24:
         hours = minutes_until // 60
         mins  = minutes_until % 60
-        time_str = (f"at {when.strftime('%Y-%m-%d %H:%M UTC')}  "
-                    f"(in {hours}h {mins}m)")
+        time_str = f"\U000023F0 When: {when.strftime('%Y-%m-%d %H:%M UTC')} (in {hours}h {mins}m) — {timeframe} trade"
     else:
         days = minutes_until // (60 * 24)
         hours = (minutes_until % (60 * 24)) // 60
-        time_str = (f"at {when.strftime('%Y-%m-%d %H:%M UTC')}  "
-                    f"(in {days}d {hours}h)")
+        time_str = f"\U000023F0 When: {when.strftime('%Y-%m-%d %H:%M UTC')} (in {days}d {hours}h) — {timeframe} trade"
 
-    # 3. Stats
-    stats = (
-        f"Edge: {edge*100:+.3f}%  |  "
-        f"Threshold: {th:.2f}  |  "
-        f"Sample size: n={n}"
-    )
+    # 3. Friendly Details line (keeps edge/threshold/n but in plain words)
+    stats = f"Details: Edge {edge*100:+.2f}% | Needs {th*100:.0f}% to fire | Based on {n} similar past cases"
 
-    # 4. Evidence
+    # 4. Evidence - friendlier wording
     target_dow = result.get("day_of_week", when.weekday())
     target_hour = result.get("hour", when.hour)
     evidence = _evidence_block(df, target_hour, target_dow) if df is not None else ""
+    evidence_friendly = ""
+    if evidence:
+        # reuse block but add friendly header
+        evidence_friendly = "History (same hour before — past is not a promise):\n" + evidence
 
-    # 5. Action
+    # 5. Action - plain + safe
     if timeframe == "30m":
         expiry = "30m"
     else:
         expiry = "4h"
     if side == "BUY":
-        action = (f"Action: place a {expiry} CALL on {asset} at {when.strftime('%H:%M UTC')}.  "
-                  f"(we don't place orders for you - open IQ Option manually)")
+        action = (f"\U000027A1 What to do: If you want, open IQ Option and place a {expiry} CALL (UP) on {asset} at {when.strftime('%H:%M UTC')}. "
+                  f"Or just watch — paper mode, not financial advice.")
     else:
-        action = (f"Action: place a {expiry} PUT on {asset} at {when.strftime('%H:%M UTC')}.  "
-                  f"(we don't place orders for you - open IQ Option manually)")
+        action = (f"\U000027A1 What to do: If you want, open IQ Option and place a {expiry} PUT (DOWN) on {asset} at {when.strftime('%H:%M UTC')}. "
+                  f"Or just watch — paper mode, not financial advice.")
 
-    # Assemble
-    parts = [header, time_str, stats]
-    if evidence:
+    # Assemble - friendly first
+    parts = [header, sub, time_str, stats]
+    if evidence_friendly:
         parts.append("")
-        parts.append("Historical evidence (in-sample, this exact slot):")
-        parts.append(evidence)
-        parts.append("   (in-sample means the model saw this data; backtest hit-rate is lower)")
+        parts.append(evidence_friendly)
     parts.append("")
     parts.append(action)
 
     return "\n".join(parts)
+
+
+def format_watch(prob: float, trend_label: str, trend: int, reason: str,
+                 atr_pct: float | None = None, macd_hist: float | None = None) -> str:
+    """Friendly WATCH / NO-TRADE alert (Option B)."""
+    emoji = {1: "\U0001f4c8", -1: "\U0001f4c9", 0: "\U0001f6cc"}.get(trend, "\U0001f6cc")
+    # Friendly reason
+    if "weekly trend NEUTRAL" in reason:
+        friendly = "Gold has no clear weekly trend — it's stuck near its 20-week average, so we're sitting out."
+    elif "confidence too low" in reason:
+        friendly = "Model is not confident enough to call direction — better to wait than guess."
+    elif "ATR filter" in reason:
+        friendly = "Market is too quiet/low volatility — choppy, easy to get faked out."
+    elif "MACD veto" in reason:
+        side_word = "up" if "BUY" in reason else "down"
+        friendly = f"Momentum is pushing opposite (trying to go {side_word} but momentum says down) — filtered."
+    elif "MACD dust" in reason:
+        friendly = "Momentum is slightly opposite — confidence was shaved by 20%."
+    else:
+        friendly = reason
+
+    lines = [
+        f"{emoji} WATCH — No Trade",
+        f"Trend: {trend_label} | Confidence: {prob*100:.0f}%",
+        f"Reason: {friendly}",
+    ]
+    # Details line (Option B — keep numbers but labelled)
+    if atr_pct is not None or macd_hist is not None:
+        a = f"ATR {atr_pct*100:.2f}%" if atr_pct is not None else "ATR n/a"
+        m = f"hist {macd_hist:.2f}" if macd_hist is not None else "hist n/a"
+        lines.append(f"Details: {a} | {m} | {reason}")
+    lines.append("")
+    lines.append("Next check in ~4h at 00,04,08,12,16,20 UTC — paper mode.")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------
