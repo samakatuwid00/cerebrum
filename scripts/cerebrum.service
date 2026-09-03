@@ -1,0 +1,18 @@
+[Unit]
+Description=Cerebrum Trader Bot — paper mode 24/7
+After=network.target
+
+[Service]
+Type=simple
+# Hermes: set WorkingDirectory to where you cloned
+WorkingDirectory=%h/cerebrum_trader_bot
+ExecStart=%h/cerebrum_trader_bot/.venv/bin/python %h/cerebrum_trader_bot/cerebrum_live.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+# .env is loaded by src/config_loader.py, no need to duplicate here
+StandardOutput=append:%h/cerebrum_trader_bot/bot.log
+StandardError=append:%h/cerebrum_trader_bot/bot.log
+
+[Install]
+WantedBy=default.target

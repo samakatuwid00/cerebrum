@@ -92,18 +92,30 @@ def _feed_loop():
             time.sleep(1)
 
 def _signal_loop():
-    """Re-evaluate BUY + SELL signal every CYCLE_SECONDS.
+    """Re-evaluate BUY + SELL + NO-TRADE signal every CYCLE_SECONDS.
 
-    Loads the best available history (XAU/USD 4h preferred, EUR/USD 30m fallback,
-    synthetic last-resort) and finds the highest-probability upcoming 4h slot.
-    Falls back to live rolling edge from IQ feed if enough bars are collected.
+    Loads XAU/USD 1h as primary (explicit filename, not degenerate daily),
+    builds baseline edge, and delegates BUY/SELL/WATCH to the MTF-aware
+    meta-labeling engine. Legacy slot-table fallback is kept but now
+    behind the unified NO-TRADE gate.
     """
-    df_hist = pl.load_history()
-    asset = "XAU/USD" if "xau" in str(ROOT / "data" / "xau_usd_4h_real.csv").lower() and pl.load_history.__module__ else "?"
+    # Explicit 1h feed for intraday (hour,dow) edge; fallback to whatever load_history picks
+    try:
+        df_hist = pl.load_history("xau_usd_1h_real.csv")
+    except FileNotFoundError:
+        df_hist = pl.load_history()
+    asset = "XAU/USD"
     synthetic_edge = pl.compute_edge(df_hist)
     print(f"[signal] baseline edge loaded ({len(synthetic_edge)} slots, "
           f"{len(df_hist)} bars from {df_hist.index.min().date()} -> {df_hist.index.max().date()})",
           flush=True)
+    # Also log live ATR/MACD diag once at startup for operability
+    try:
+        _atr = pl.compute_atr_pct(df_hist).iloc[-1]
+        _, _, _hist = pl.compute_macd(df_hist["close"])
+        print(f"[signal] live diag: ATR%={_atr:.4f} MACD hist={_hist.iloc[-1]:.2f}", flush=True)
+    except Exception as e:
+        print(f"[signal] live diag failed: {e}", flush=True)
 
     # wait until we have at least one live tick (FX or IQ)
     while not _stop.is_set() and not (LIVE_CSV.exists() or _iq_csv_exists()):
@@ -133,16 +145,24 @@ def _signal_loop():
 
                 print(f"\n— {now.strftime('%Y-%m-%d %H:%M:%S')} UTC  |  {live_summary}")
 
-                # ===== PREDICTIVE ENGINE: meta-labeling (paper mode) =====
-                meta_res = meta_live.predict_meta(filename=META_FILE,
+                # ===== PREDICTIVE ENGINE: meta-labeling (MTF-aware, paper mode) =====
+                # filename must match df_hist's 1h feed; META_FILE overrides only if set
+                meta_filename = META_FILE or "xau_usd_1h_real.csv"
+                meta_res = meta_live.predict_meta(filename=meta_filename,
                                                  horizon=META_HORIZON,
                                                  threshold=META_THRESHOLD)
+                # Unified BUY / SELL / WATCH(=NO-TRADE) handling
+                # meta_res["trade"]=True => BUY/SELL, else WATCH with explicit reason
                 if meta_res.get("trade"):
                     side = meta_res["side"]
                     prob = meta_res["take_probability"] or meta_res["probability"]
                     src = meta_res["edge_source"]
+                    atr = meta_res.get("atr_pct", None)
+                    hist = meta_res.get("macd_hist", None)
+                    atr_s = f" ATR%={atr:.4f}" if atr is not None else ""
+                    hist_s = f" hist={hist:.2f}" if hist is not None else ""
                     print(f"[META/{side}] prob={prob:.3f} horizon={meta_res['horizon']} "
-                          f"thr={meta_res['threshold']} src={src}")
+                          f"thr={meta_res['threshold']} src={src}{atr_s}{hist_s} | {meta_res['reason']}")
                     alert.send_message(
                         alert.format_window(
                             {"window_start_utc": now.isoformat(),
@@ -161,41 +181,50 @@ def _signal_loop():
                     reason = meta_res["reason"]
                     trend_label = meta_res["trend_label"]
                     prob = meta_res["probability"] or 0.0
-                    side = meta_res["side"] or "?"
+                    side = meta_res["side"] or "WATCH"
+                    atr = meta_res.get("atr_pct", None)
+                    hist = meta_res.get("macd_hist", None)
+                    atr_s = f" ATR%={atr:.4f}" if atr is not None else ""
+                    hist_s = f" hist={hist:.2f}" if hist is not None else ""
                     trend_emoji = {1: "\U0001f4c8", -1: "\U0001f4c9", 0: "\U0001f6cc"}.get(meta_res["trend"], "\U0001f6cc")
-                    status = (f"{trend_emoji} [META STATUS] trend={trend_label} | P(up)={prob:.3f} | "
+                    status = (f"{trend_emoji} [META NO-TRADE] WATCH trend={trend_label} | P(up)={prob:.3f}{atr_s}{hist_s} | "
                               f"reason: {reason}")
                     print(status)
                     alert.send_message(status)
-                    # ===== LEGACY FALLBACK: old slot-table engine =====
-                    best = pl.find_best_window_in_next_24h(edge, threshold=THRESHOLD,
-                                                            lam=LAMBDA, top_n=6)
-                    buy  = [s for s in best if s.get("side") == "BUY"]
-                    sell = [s for s in best if s.get("side") == "SELL"]
-                    buy  = buy[0]  if buy  else {"none": None}
-                    sell = sell[0] if sell else {"none": None}
-                    if "none" in buy:
-                        print("[BUY]  : no window above threshold")
+                    # Legacy fallback is now *gated* — only emit if meta was high-confidence WATCH
+                    # due to weekly neutral, not low-vol/MACD veto. Prevents noisy slot-table spam.
+                    if "weekly trend NEUTRAL" in reason or "confidence too low" in reason:
+                        best = pl.find_best_window_in_next_24h(edge, threshold=THRESHOLD,
+                                                                lam=LAMBDA, top_n=6)
+                        buy  = [s for s in best if s.get("side") == "BUY"]
+                        sell = [s for s in best if s.get("side") == "SELL"]
+                        buy  = buy[0]  if buy  else {"none": None}
+                        sell = sell[0] if sell else {"none": None}
+                        if "none" in buy:
+                            print("[BUY]  : no window above threshold")
+                        else:
+                            when = dt.datetime.fromisoformat(buy["window_start_utc"])
+                            mins = (when - now).total_seconds() / 60
+                            print(f"[BUY]  -> {when.strftime('%H:%M')} UTC (in {mins:+.0f} min) "
+                                  f"prob={buy['probability']:.3f}")
+                            alert.send_message(alert.format_window(buy, side="BUY",
+                                                                    threshold=THRESHOLD,
+                                                                    asset="XAU/USD",
+                                                                    df=df_hist, timeframe="4h"))
+                        if "none" in sell:
+                            print("[SELL] : no window above threshold")
+                        else:
+                            when = dt.datetime.fromisoformat(sell["window_start_utc"])
+                            mins = (when - now).total_seconds() / 60
+                            print(f"[SELL] -> {when.strftime('%H:%M')} UTC (in {mins:+.0f} min) "
+                                  f"prob={sell['probability']:.3f}")
+                            alert.send_message(alert.format_window(sell, side="SELL",
+                                                                    threshold=THRESHOLD,
+                                                                    asset="XAU/USD",
+                                                                    df=df_hist, timeframe="4h"))
                     else:
-                        when = dt.datetime.fromisoformat(buy["window_start_utc"])
-                        mins = (when - now).total_seconds() / 60
-                        print(f"[BUY]  -> {when.strftime('%H:%M')} UTC (in {mins:+.0f} min) "
-                              f"prob={buy['probability']:.3f}")
-                        alert.send_message(alert.format_window(buy, side="BUY",
-                                                                threshold=THRESHOLD,
-                                                                asset="XAU/USD",
-                                                                df=df_hist, timeframe="4h"))
-                    if "none" in sell:
-                        print("[SELL] : no window above threshold")
-                    else:
-                        when = dt.datetime.fromisoformat(sell["window_start_utc"])
-                        mins = (when - now).total_seconds() / 60
-                        print(f"[SELL] -> {when.strftime('%H:%M')} UTC (in {mins:+.0f} min) "
-                              f"prob={sell['probability']:.3f}")
-                        alert.send_message(alert.format_window(sell, side="SELL",
-                                                                threshold=THRESHOLD,
-                                                                asset="XAU/USD",
-                                                                df=df_hist, timeframe="4h"))
+                        # ATR/MACD vetoed — stay in WATCH, do not spam legacy windows
+                        print(f"[FALLBACK] suppressed — MTF veto: {reason}")
 
                 # ---- 30-minute hybrid scanner ----
                 # Aggregates 1-min IQ bars into 30-min candles, computes edge,

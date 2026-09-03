@@ -33,6 +33,7 @@ EUR_30M_CSV   = DATA / "usd_eur_hourly_30min_real.csv"     # fallback (EUR 30m)
 SYNTH_CSV     = DATA / "usd_eur_hourly_synthetic.csv"      # last-resort fallback
 OLD_HOURLY_CSV = DATA / "usd_eur_hourly.csv"               # legacy alias
 DXY_1H_CSV    = DATA / "dxy_1h_real.csv"                   # cross-asset: US Dollar Index (1h)
+US10Y_1H_CSV  = DATA / "us10y_1h_real.csv"                 # cross-asset: 10Y Treasury yield (1h, ^TNX percent)
 ECON_CAL_CSV  = DATA / "economic_calendar.csv"             # hardcoded high-impact US events 2024-2026
 
 # Weekly timeframe (computed from daily)
@@ -170,21 +171,24 @@ def combine_probability_mtf(edge_row: pd.Series,
         mom_boost=mom_boost,
     )
     
-    # Determine daily signal direction from edge
-    daily_side = edge_row.get('side', 'BUY')  # default from compute_edge
+    # Determine daily signal direction from live probability (not stale slot side)
+    # base is P(up) after RSI/BB/momentum nudges; >=0.5 => BUY bias, <0.5 => SELL bias
+    daily_side = "BUY" if base >= 0.5 else "SELL"
+    # Allow explicit override if caller passed side on the row (live path)
+    if "side" in edge_row and edge_row.get("side") in ("BUY", "SELL"):
+        daily_side = edge_row.get("side")
     
-    # Weekly trend alignment
+    # Weekly trend alignment — filter, not predictor
     if weekly_trend == 1 and daily_side == 'BUY':
-        # Aligned uptrend + BUY signal
         base += mtf_boost
     elif weekly_trend == -1 and daily_side == 'SELL':
-        # Aligned downtrend + SELL signal
-        base += mtf_boost
-    elif weekly_trend == 1 and daily_side == 'SELL':
-        # Counter-trend: uptrend but SELL signal
+        # SELL confidence is 1 - P(up), so boosting SELL means lowering P(up)
         base -= mtf_boost
+    elif weekly_trend == 1 and daily_side == 'SELL':
+        # Counter-trend SELL in uptrend -> penalize SELL (raise P(up) toward 0.5)
+        base += mtf_boost
     elif weekly_trend == -1 and daily_side == 'BUY':
-        # Counter-trend: downtrend but BUY signal
+        # Counter-trend BUY in downtrend -> penalize BUY
         base -= mtf_boost
     # weekly_trend == 0 -> no change
     
@@ -194,21 +198,33 @@ def combine_probability_mtf(edge_row: pd.Series,
 def load_history(filename: Optional[str] = None) -> pd.DataFrame:
     """Load the best available history.
 
-    Priority:
-        1. explicit `filename` arg (relative to data/)
-        2. data/xau_usd_1h_real.csv           (Gold 1h, yfinance)
-        3. data/xau_usd_4h_real.csv           (Gold 4h, yfinance, fallback)
+    Priority when filename is explicit: that file.
+    Priority when filename is None (live / backtest default):
+        1. data/xau_usd_1h_real.csv           (Gold 1h, yfinance) — preferred intraday
+        2. data/xau_usd_4h_real.csv           (Gold 4h, yfinance, fallback)
+        3. data/xau_usd_daily_real.csv        (Gold daily, only for weekly generation)
+        3b. data/xau_usd_weekly_real.csv      (should not be used as bar feed)
         4. data/usd_eur_hourly_30min_real.csv (EUR 30m fallback)
         5. data/usd_eur_hourly_synthetic.csv  (kept as fallback)
         6. data/usd_eur_hourly.csv            (legacy synthetic)
+
+    NOTE: XAU_DAILY_CSV is deliberately *not* in the auto-pick list for
+    intraday engines — its hour is always 00:00, so (hour,dow) edge is
+    meaningless and backtests on it look artificially good. Callers that
+    truly want daily must pass filename explicitly.
     """
     if filename:
         return _load_csv(DATA / filename)
-    for p in (XAU_DAILY_CSV, XAU_1H_CSV, XAU_4H_CSV, EUR_30M_CSV, SYNTH_CSV, OLD_HOURLY_CSV):
+    for p in (XAU_1H_CSV, XAU_4H_CSV, EUR_30M_CSV, SYNTH_CSV, OLD_HOURLY_CSV):
         if p.exists():
             return _load_csv(p)
+    # Daily only as last resort with explicit warning
+    if XAU_DAILY_CSV.exists():
+        import warnings
+        warnings.warn(f"load_history() falling back to daily {XAU_DAILY_CSV.name} — (hour,dow) edge will be degenerate. Pass filename explicitly if daily is intended.")
+        return _load_csv(XAU_DAILY_CSV)
     raise FileNotFoundError(
-        f"No data file found in {DATA}. Run data/fetch_xau_4h.py first."
+        f"No data file found in {DATA}. Run data/fetch_xau_1h.py first."
     )
 
 
@@ -332,6 +348,7 @@ def compute_edge_with_features(df: pd.DataFrame, period: int = 14,
     edge = edge.merge(bb_by_slot, on=["hour", "day_of_week"], how="left")
     edge = edge.merge(mom_by_slot, on=["hour", "day_of_week"], how="left")
     edge = edge[edge["count"] >= min_count].copy()
+    return edge.reset_index(drop=True)
     # ----------------------------------------------------------------------------- #
 # ATR feature (Average True Range) — volatility filter
 # ----------------------------------------------------------------------------- #
@@ -708,6 +725,70 @@ def merge_dxy_features(df: pd.DataFrame, dxy: pd.DataFrame | None = None
     return merged
 
 
+def load_us10y_history() -> pd.DataFrame:
+    """Load ``data/us10y_1h_real.csv`` (10Y Treasury yield, 1h bars, ^TNX %).
+
+    Mirror of load_dxy_history(). Raises FileNotFoundError pointing at the
+    fetcher so the caller can degrade or fetch first.
+    """
+    if not US10Y_1H_CSV.exists():
+        raise FileNotFoundError(
+            f"US10Y file not found at {US10Y_1H_CSV}. Run data/fetch_us10y.py first."
+        )
+    return _load_csv(US10Y_1H_CSV)
+
+
+def merge_us10y_features(df: pd.DataFrame, us10y: pd.DataFrame | None = None
+                         ) -> pd.DataFrame:
+    """Merge US10Y (10-Year Treasury yield) returns into a Gold DataFrame.
+
+    Adds three causal features computed at each Gold bar's timestamp using the
+    matching US10Y close (yield in percent):
+
+        us10y_close         : aligned US10Y level (for sanity)
+        us10y_return_1h     : US10Y 1h percentage return (current / prev - 1)
+        us10y_return_4h     : US10Y 4h percentage return
+        us10y_return_24h    : US10Y 24h percentage return
+
+    The merge uses ``merge_asof`` on the UTC timestamp index with ``backward``
+    direction (use the most recent US10Y bar at or before each Gold bar). This
+    is leak-safe: no future yield bar influences the current Gold bar's features.
+
+    If US10Y is not available, returns the input DataFrame unchanged with NaN
+    feature columns so callers can degrade gracefully.
+    """
+    if us10y is None:
+        if not US10Y_1H_CSV.exists():
+            out = df.copy()
+            out["us10y_close"] = np.nan
+            out["us10y_return_1h"] = np.nan
+            out["us10y_return_4h"] = np.nan
+            out["us10y_return_24h"] = np.nan
+            return out
+        us10y = load_us10y_history()
+
+    us10y = us10y.copy()
+    us10y = us10y.rename(columns={"close": "us10y_close"})
+    us10y["us10y_return_1h"] = us10y["us10y_close"].pct_change(1)
+    us10y["us10y_return_4h"] = us10y["us10y_close"].pct_change(4)
+    us10y["us10y_return_24h"] = us10y["us10y_close"].pct_change(24)
+
+    # Both indices are tz-aware UTC; sort for merge_asof
+    gold = df.copy().sort_index()
+    us10y = us10y[["us10y_close", "us10y_return_1h",
+                   "us10y_return_4h", "us10y_return_24h"]].sort_index()
+
+    merged = pd.merge_asof(
+        left=gold,
+        right=us10y,
+        left_index=True,
+        right_index=True,
+        direction="backward",
+        tolerance=pd.Timedelta("2h"),  # US10Y is hourly; allow up to 2h slack
+    )
+    return merged
+
+
 # ----------------------------------------------------------------------------- #
 # Economic calendar (hardcoded high-impact US events)
 # ----------------------------------------------------------------------------- #
@@ -910,6 +991,48 @@ def combine_probability_dxy(edge_row: pd.Series,
     delta += dxy_boost * _neg_tanh(dxy_return_1h)
     delta += dxy_boost * _neg_tanh(dxy_return_4h)
     delta += dxy_boost * _neg_tanh(dxy_return_24h)
+
+    return float(round(max(0.01, min(0.99, base + delta)), 4))
+
+
+def combine_probability_us10y(edge_row: pd.Series,
+                               us10y_return_1h: float = 0.0,
+                               us10y_return_4h: float = 0.0,
+                               us10y_return_24h: float = 0.0,
+                               lam: float = 0.3,
+                               sentiment: float = 0.0,
+                               us10y_boost: float = 0.10,
+                               us10y_scale: float = 10.0) -> float:
+    """Sharpe-logistic probability nudged by US10Y (10Y Treasury yield) returns.
+
+    US10Y moves POSITIVELY with the dollar (and thus NEGATIVELY to gold): when
+    real yields rise, gold tends to fall, and vice versa. The sign convention
+    therefore matches DXY — we negate the yield returns:
+
+        nudge = us10y_boost * (
+            - tanh(us10y_return_1h  * us10y_scale)   # 1h: short-horizon causality
+            - tanh(us10y_return_4h  * us10y_scale)   # 4h: medium-horizon
+            - tanh(us10y_return_24h * us10y_scale)   # 24h: regime signal
+        ) / 3
+
+    Each term contributes at most +/- us10y_boost/3, so the combined nudge is
+    bounded by +/- us10y_boost (≈ +/-0.10 by default). The default scale (10)
+    means a 10% yield move (extreme) produces a near-saturated nudge.
+
+    NaN-safe: any NaN feature contributes 0.
+    """
+    base = combine_probability(edge_row, lam=lam, sentiment=sentiment)
+    delta = 0.0
+
+    def _neg_tanh(x):
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return 0.0
+        return -float(np.tanh(float(x) * us10y_scale))
+
+    delta += us10y_boost * _neg_tanh(us10y_return_1h)
+    delta += us10y_boost * _neg_tanh(us10y_return_4h)
+    delta += us10y_boost * _neg_tanh(us10y_return_24h)
+    delta = delta / 3.0
 
     return float(round(max(0.01, min(0.99, base + delta)), 4))
 

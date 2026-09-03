@@ -21,6 +21,8 @@ from src.pipeline import (
     get_weekly_trend_at,
     combine_probability_mtf,
     compute_edge_with_atr_macd,
+    compute_atr_pct,
+    compute_macd,
 )
 
 
@@ -90,11 +92,17 @@ def run_backtest_vectorized(threshold: float = 0.50, lam: float = 0.3,
     )
     edge["prob"] = edge[["prob_up", "prob_dn"]].max(axis=1)
     
-    # Precompute returns for all bars
+    # Precompute returns + LIVE (not slot-average) ATR/MACD for MTF veto
     df = df.copy()
     df["ret"] = df["close"].pct_change()
     df["hour"] = df.index.hour
     df["day_of_week"] = df.index.dayofweek
+    # Live indicators on actual bar (not seasonal mean) — for correct veto
+    if use_mtf:
+        live_atr = compute_atr_pct(df)
+        _, _, live_hist = compute_macd(df["close"])
+        df["_live_atr"] = live_atr
+        df["_live_macd_hist"] = live_hist
     
     # Merge edge probabilities onto each bar (lookup by hour, day_of_week)
     # Preserve the DatetimeIndex by using left_index/right_index merge
@@ -112,16 +120,16 @@ def run_backtest_vectorized(threshold: float = 0.50, lam: float = 0.3,
     df = df.sort_index()
     
     # Filter: after warmup, has signal, prob >= threshold
-    # For MTF, also filter by ATR and MACD
+    # For MTF, also filter by LIVE ATR/MACD (not slot-average) + weekly handled per-bar
     if use_mtf:
         mask = (
             (df.index >= df.index[warmup_bars]) &
             (df["prob"].notna()) &
             (df["prob"] >= threshold) &
             (df["ret"].notna()) &
-            (df["atr_pct_at_open"].notna()) &
-            (df["atr_pct_at_open"] >= atr_min_pct) &  # ATR volatility filter
-            (df["macd_hist_at_open"].notna())
+            (df["_live_atr"].notna()) &
+            (df["_live_atr"] >= atr_min_pct) &  # LIVE volatility filter (fix: was slot-average)
+            (df["_live_macd_hist"].notna())
         )
     else:
         mask = (
@@ -136,15 +144,17 @@ def run_backtest_vectorized(threshold: float = 0.50, lam: float = 0.3,
         print(f"[backtest] No trades at threshold={threshold}")
         return pd.DataFrame(), {}
     
-    # For MTF, we need to apply weekly trend per-bar and MACD filter
+    # For MTF, we need to apply weekly trend per-bar and LIVE MACD veto
     if use_mtf:
-        # Apply weekly trend and MACD per trade bar
+        # Apply weekly trend and LIVE MACD veto per trade bar
         probs_adjusted = []
+        sides_adjusted = []
+        veto_masks = []
         for idx, row in trade_bars.iterrows():
             ts = idx
             weekly_trend_val = get_weekly_trend_at(weekly_df, ts)
             
-            # Recompute probability with actual weekly trend
+            # Recompute probability with actual weekly trend (base derived from slot, nudged by weekly)
             prob_up_mtf = combine_probability_mtf(
                 row,
                 daily_rsi=row.get('rsi_at_open', 50.0),
@@ -155,18 +165,38 @@ def run_backtest_vectorized(threshold: float = 0.50, lam: float = 0.3,
                 sentiment=load_sentiment_score(row["hour"]),
             )
             
-            # MACD confirmation
-            macd_hist = row.get('macd_hist_at_open', 0.0)
+            # LIVE MACD veto — mirrors meta_live logic (current-bar hist, not slot mean)
+            macd_hist_live = row.get('_live_macd_hist', 0.0)
+            atr_live = row.get('_live_atr', 0.0)
+            # ATR already filtered, but keep for diagnostics
             prob_dn_mtf = 1.0 - prob_up_mtf
             side = "BUY" if prob_up_mtf >= prob_dn_mtf else "SELL"
-            if (side == "BUY" and macd_hist < 0) or (side == "SELL" and macd_hist > 0):
-                prob_up_mtf = prob_up_mtf * 0.8  # 20% penalty
+            # Veto if clearly opposing (outside dust)
+            veto = False
+            if side == "BUY" and macd_hist_live is not None and macd_hist_live < -0.1:
+                veto = True
+            elif side == "SELL" and macd_hist_live is not None and macd_hist_live > 0.1:
+                veto = True
+            if veto:
+                veto_masks.append(True)
+                # mark as vetoed, will be dropped below
+                probs_adjusted.append(float('nan'))
+                sides_adjusted.append(side)
+                continue
+            # Dust opposite -> 20% shave (mirrors meta_live soft penalty)
+            if (side == "BUY" and macd_hist_live is not None and -0.1 <= macd_hist_live < 0) or \
+               (side == "SELL" and macd_hist_live is not None and 0 < macd_hist_live <= 0.1):
+                prob = prob_up_mtf if side == "BUY" else prob_dn_mtf
+                prob = prob * 0.8
+                prob_up_mtf = prob if side == "BUY" else 1 - prob
             
             probs_adjusted.append(max(prob_up_mtf, 1.0 - prob_up_mtf))
+            sides_adjusted.append("BUY" if prob_up_mtf >= 0.5 else "SELL")
         
         trade_bars["prob"] = probs_adjusted
-        trade_bars["side"] = ["BUY" if prob_up >= 0.5 else "SELL" for prob_up in probs_adjusted]
-        
+        trade_bars["side"] = sides_adjusted
+        # Drop vetoed
+        trade_bars = trade_bars[trade_bars["prob"].notna()].copy()
         # Re-filter by threshold after MTF adjustment
         trade_bars = trade_bars[trade_bars["prob"] >= threshold].copy()
         
@@ -246,9 +276,13 @@ def run_backtest_walkforward(threshold: float = 0.50, lam: float = 0.3,
     df = load_history(filename)
     print(f"[backtest] Loaded {len(df)} bars ({df.index.min()} -> {df.index.max()})")
     
-    # Precompute returns
+    # Precompute returns + LIVE (not slot-average) ATR/MACD for correct walk-forward
     df = df.copy()
     df["ret"] = df["close"].pct_change()
+    if use_mtf:
+        df["_live_atr"] = compute_atr_pct(df)
+        _, _, _live_hist_wf = compute_macd(df["close"])
+        df["_live_macd_hist"] = _live_hist_wf
     
     trades = []
     
@@ -259,7 +293,7 @@ def run_backtest_walkforward(threshold: float = 0.50, lam: float = 0.3,
     # For MTF, we need weekly data
     if use_mtf:
         weekly_df = load_weekly_history()
-        print(f"[backtest] Using MTF: weekly trend + ATR {atr_min_pct*100:.2f}% filter + MACD confirmation")
+        print(f"[backtest] Using MTF: weekly trend + ATR {atr_min_pct*100:.2f}% filter + LIVE MACD confirmation")
     else:
         weekly_df = None
     
@@ -297,6 +331,12 @@ def run_backtest_walkforward(threshold: float = 0.50, lam: float = 0.3,
         row = match.iloc[0]
         sent = load_sentiment_score(target_hour)
         
+        # LIVE MTF veto checks (mirrors meta_live)
+        if use_mtf:
+            live_atr = df.iloc[i].get("_live_atr", None) if "_live_atr" in df.columns else None
+            live_hist = df.iloc[i].get("_live_macd_hist", None) if "_live_macd_hist" in df.columns else None
+            if live_atr is not None and pd.notna(live_atr) and live_atr < atr_min_pct:
+                continue  # low-vol chop => NO-TRADE
         # Compute probability with or without MTF
         if use_mtf and 'rsi_at_open' in row:
             prob_up = combine_probability_mtf(
@@ -308,16 +348,32 @@ def run_backtest_walkforward(threshold: float = 0.50, lam: float = 0.3,
                 lam=lam,
                 sentiment=sent,
             )
-            
-            # MACD confirmation
-            macd_hist = row.get('macd_hist_at_open', 0.0)
+            # LIVE MACD veto (not slot-average)
+            live_hist = df.iloc[i].get("_live_macd_hist", 0.0) if "_live_macd_hist" in df.columns else row.get('macd_hist_at_open', 0.0)
+            prob_dn_tmp = 1.0 - prob_up
+            side_tmp = "BUY" if prob_up >= prob_dn_tmp else "SELL"
+            veto = False
+            if side_tmp == "BUY" and live_hist is not None and pd.notna(live_hist) and live_hist < -0.1:
+                veto = True
+            elif side_tmp == "SELL" and live_hist is not None and pd.notna(live_hist) and live_hist > 0.1:
+                veto = True
+            if veto:
+                continue  # MACD opposes => NO-TRADE
+            # dust opposite -> 20% shave
+            if (side_tmp == "BUY" and live_hist is not None and -0.1 <= live_hist < 0) or \
+               (side_tmp == "SELL" and live_hist is not None and 0 < live_hist <= 0.1):
+                if side_tmp == "BUY":
+                    prob_up = prob_up * 0.8
+                else:
+                    prob_up = 1 - (1 - prob_up) * 0.8
             prob_dn = 1.0 - prob_up
-            side = "BUY" if prob_up >= prob_dn else "SELL"
-            if (side == "BUY" and macd_hist < 0) or (side == "SELL" and macd_hist > 0):
-                prob_up = prob_up * 0.8  # 20% penalty
         else:
             prob_up = combine_probability(row, lam=lam, sentiment=sent)
             prob_dn = 1.0 - prob_up
+            if use_mtf:
+                # use_mtf but row lacks MTF cols -> still apply weekly nudge via base prob
+                # (edge case: early hist with <30 samples before ATR/MACD ready)
+                pass
         
         side = None
         prob = None
