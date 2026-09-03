@@ -121,16 +121,36 @@ def _signal_loop():
     while not _stop.is_set() and not (LIVE_CSV.exists() or _iq_csv_exists()):
         time.sleep(1)
 
+    _last_4h_slot: dt.datetime | None = None
+
     while not _stop.is_set():
         try:
             now = dt.datetime.now(pytz.UTC)
             
-            # Throttle to 4h boundaries: only run at 00, 04, 08, 12, 16, 20 UTC
-            # But still check every minute to catch the boundary quickly
-            if now.hour % 4 != 0:
-                # Not at a 4h boundary – skip this cycle
+            # Throttle to once per 4h candle: 00,04,08,12,16,20 UTC, first 5 min only
+            slot_hour = (now.hour // 4) * 4
+            slot = now.replace(hour=slot_hour, minute=0, second=0, microsecond=0)
+            is_new_slot = (_last_4h_slot is None or slot != _last_4h_slot)
+            within_window = (now - slot).total_seconds() < 300  # first 5 min of slot
+            # Fallback epoch check for clock skew: int(now.timestamp()) % 14400 < 60
+            epoch_ok = int(now.timestamp()) % 14400 < 300
+
+            if not (is_new_slot and within_window and epoch_ok):
+                if is_new_slot and not within_window:
+                    # Past slot but we started mid-candle — wait for next 4h, don't spam old slot
+                    pass
+                elif not is_new_slot:
+                    # Already alerted this 4h candle — debounce
+                    pass
+                # Sleep and retry; add debug every 30 min to show throttling is alive
+                if now.minute % 30 == 0 and now.second < 5:
+                    nxt = slot + dt.timedelta(hours=4) if not is_new_slot else slot
+                    if not is_new_slot:
+                        nxt = _last_4h_slot + dt.timedelta(hours=4) if _last_4h_slot else slot
+                    print(f"[throttle] skip {now.strftime('%H:%M:%S')} UTC — next 4h slot {nxt.strftime('%H:%M')} UTC", flush=True)
                 pass
             else:
+                _last_4h_slot = slot
                 rates = _load_live_rates()
                 live_summary = _summarise_live(rates)
 
