@@ -10,6 +10,7 @@ A Python trading signal bot for XAU/USD (Gold) that produces timestamped, eviden
 - **Telegram alerts** - Real-time notifications with BUY/SELL signals
 - **Paper trading mode** - Log all decisions without executing trades
 - **Live data feeds** - IQ Option WebSocket + FX rate polling
+- **Cross-asset drivers** - DXY (US Dollar Index) and US10Y (10Y Treasury yield) as causal, leak-safe features for the 1h model. US10Y moves *inversely* to gold (higher real yields → stronger dollar → weaker gold), so a rising yield nudges the gold-up probability down. DXY and US10Y gate separately; both can be combined later for a compound nudge.
 
 ## Architecture
 

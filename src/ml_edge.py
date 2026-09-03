@@ -38,6 +38,7 @@ from src.pipeline import (
     load_weekly_history,
     compute_weekly_trend,
     DXY_1H_CSV,
+    US10Y_1H_CSV,
     _load_csv,
 )
 
@@ -48,6 +49,8 @@ FEATURES = [
     "vwap_dev_atr",
     "hour_sin", "hour_cos", "dow_cos",
     "weekly_trend",
+    # cross-asset lead (append-only; order not shifted per hard constraint)
+    "us10y_ret_1", "us10y_ret_4", "us10y_rsi",
 ]
 # Pruned after permutation importance showed negative/zero contribution:
 # atr_pct, dow_sin, dxy_ret_4 (hour_cos kept as pair with hour_sin).
@@ -100,6 +103,27 @@ def _dxy_features(target_index: pd.DatetimeIndex) -> pd.DataFrame:
     return out
 
 
+def _us10y_features(target_index: pd.DatetimeIndex) -> pd.DataFrame:
+    """10Y-Treasury-yield lead features aligned (ffill) onto the target bar index.
+
+    us10y_ret_1 / us10y_ret_4 : US10Y % change over last 1 / 4 bars
+    us10y_rsi                 : RSI(14) of US10Y close
+
+    Mirror of _dxy_features(). If US10Y_1H_CSV is missing, return an empty
+    DataFrame with those columns (NaN-filled) so the matrix degrades gracefully.
+    """
+    if not US10Y_1H_CSV.exists():
+        return pd.DataFrame(index=target_index,
+                            columns=["us10y_ret_1", "us10y_ret_4", "us10y_rsi"], dtype=float)
+    us10y = _load_csv(US10Y_1H_CSV)
+    us10y = us10y.reindex(us10y.index.union(target_index)).ffill().reindex(target_index)
+    out = pd.DataFrame(index=target_index)
+    out["us10y_ret_1"] = us10y["close"].pct_change(1)
+    out["us10y_ret_4"] = us10y["close"].pct_change(4)
+    out["us10y_rsi"] = compute_rsi(us10y["close"], period=14)
+    return out
+
+
 def _weekly_trend_series(target_index: pd.DatetimeIndex) -> pd.Series:
     """Weekly trend (+1/-1/0) mapped onto each bar, using only weeks already
     complete at that bar (no lookahead)."""
@@ -133,6 +157,7 @@ def build_features(df: pd.DataFrame, horizon: int = 1) -> tuple[pd.DataFrame, pd
 
     # cross-asset lead
     X = X.join(_dxy_features(df.index))
+    X = X.join(_us10y_features(df.index))
 
     # calendar (cyclical)
     hour = df.index.hour + df.index.minute / 60.0
